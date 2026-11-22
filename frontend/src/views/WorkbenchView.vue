@@ -37,6 +37,97 @@
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <section v-if="meta.key === 'predict_batch'" class="shard-panel" data-testid="shard-panel">
+      <header class="shard-head">
+        <h3>分片交付</h3>
+        <span class="shard-hint">按同批同模型版本合并实际结果行；缺片版本仅可抽查，全量版才可复核。</span>
+      </header>
+      <div class="filter-bar">
+        <label class="filter-item">
+          <span>预测任务</span>
+          <select v-model.number="shardTaskId" data-testid="shard-task">
+            <option v-for="row in rows" :key="String(row.id)" :value="Number(row.id)">
+              {{ row['任务编号'] }}（#{{ row.id }}）
+            </option>
+          </select>
+        </label>
+        <button class="btn" data-testid="shard-load" type="button" @click="loadManifest">
+          读取分片清单
+        </button>
+        <button class="btn" data-testid="shard-publish-spot" type="button" @click="publish(false)">
+          发布抽查版
+        </button>
+        <button
+          class="btn primary"
+          data-testid="shard-publish-full"
+          type="button"
+          :disabled="!manifest?.complete"
+          @click="publish(true)"
+        >
+          发布全量版
+        </button>
+      </div>
+
+      <p v-if="manifest" class="shard-summary" data-testid="shard-summary">
+        模型版本 {{ manifest.model_version }}｜预计 {{ manifest.expected_count }} 片，已收
+        {{ manifest.completed_count }} 片｜覆盖 {{ manifest.coverage_range || '无' }}｜
+        缺片 {{ manifest.missing_partitions.join(',') || '无' }}｜
+        {{ manifest.complete ? '全量标记：是' : '全量标记：否（仅可抽查）' }}
+      </p>
+
+      <table v-if="versions.length" class="data-table" data-testid="shard-versions">
+        <thead>
+          <tr>
+            <th>版本</th><th>状态</th><th>全量标记</th><th>模型版本</th>
+            <th>覆盖分区</th><th>缺失分区</th><th>行数</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="version in versions" :key="version.id" :data-testid="`version-${version.id}`">
+            <td>{{ version.version_label }}</td>
+            <td>{{ version.status }}</td>
+            <td>{{ version.full_coverage ? '是' : '否' }}</td>
+            <td>{{ version.model_version }}</td>
+            <td>{{ version.coverage_range || '—' }}</td>
+            <td>{{ version.missing_partitions.join(',') || '—' }}</td>
+            <td>{{ version.row_count }}</td>
+            <td class="row-actions">
+              <button class="link" data-testid="download-spot" type="button" @click="download(version, 'spot')">
+                下载抽查
+              </button>
+              <button
+                v-if="version.full_coverage"
+                class="link"
+                data-testid="download-full"
+                type="button"
+                @click="download(version, 'full')"
+              >
+                下载全量
+              </button>
+              <button
+                v-if="version.status !== '已归档'"
+                class="link"
+                data-testid="archive-version"
+                type="button"
+                @click="archive(version)"
+              >
+                归档
+              </button>
+              <button
+                v-else
+                class="link"
+                data-testid="reopen-version"
+                type="button"
+                @click="reopen(version)"
+              >
+                重新打开
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <table class="data-table">
       <thead>
         <tr>
@@ -97,12 +188,19 @@
 import { computed, onMounted, ref } from 'vue'
 
 import {
+  archiveDeliveryVersion,
+  buildShardManifest,
   createEntry,
+  downloadDeliveryVersion,
   downloadEntries,
+  listDeliveryVersions,
   listEntries,
   moduleMeta,
+  publishDeliveryVersion,
+  reopenDeliveryVersion,
   runAction as applyAction,
 } from '@/api/backend-service'
+import type { DeliveryVersion, ShardManifest } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +213,9 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const shardTaskId = ref<number>(0)
+const manifest = ref<ShardManifest | null>(null)
+const versions = ref<DeliveryVersion[]>([])
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -182,8 +283,65 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (meta.key === 'predict_batch' && !rows.value.some((row) => Number(row.id) === shardTaskId.value)) {
+      shardTaskId.value = rows.value.length ? Number(rows.value[0].id) : 0
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
+  }
+}
+
+async function loadManifest() {
+  if (!shardTaskId.value) return
+  errorMessage.value = ''
+  try {
+    manifest.value = await buildShardManifest(shardTaskId.value)
+    versions.value = await listDeliveryVersions(shardTaskId.value)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '分片清单读取失败'
+  }
+}
+
+async function publish(requireFull: boolean) {
+  if (!shardTaskId.value) return
+  errorMessage.value = ''
+  try {
+    const result = await publishDeliveryVersion(shardTaskId.value, { requireFull })
+    if (!result.ok) throw new Error(result.message)
+    await loadManifest()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '版本发布失败'
+  }
+}
+
+async function download(version: DeliveryVersion, scope: 'spot' | 'full') {
+  errorMessage.value = ''
+  try {
+    await downloadDeliveryVersion(version.id, scope)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '下载失败'
+  }
+}
+
+async function archive(version: DeliveryVersion) {
+  errorMessage.value = ''
+  try {
+    const result = await archiveDeliveryVersion(version.id)
+    if (!result.ok) throw new Error(result.message)
+    await loadManifest()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '归档失败'
+  }
+}
+
+async function reopen(version: DeliveryVersion) {
+  errorMessage.value = ''
+  try {
+    const result = await reopenDeliveryVersion(version.id)
+    if (!result.ok) throw new Error(result.message)
+    await loadManifest()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '重新打开失败'
   }
 }
 

@@ -14,6 +14,9 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 附属账本（分片回执、分区计划、交付版本）不属于 18 个业务模块，
+        # 单独存放，避免出现在模块列表和运营概览里。
+        self._aux_tables: dict[str, list[dict[str, Any]]] = {}
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -23,6 +26,16 @@ class Store:
 
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):
+            if int(row.get("id", 0)) == entry_id:
+                return row
+        return None
+
+    def aux_rows(self, name: str) -> list[dict[str, Any]]:
+        """分片交付附属账本：不参与业务模块列表和概览统计。"""
+        return self._aux_tables.setdefault(name, [])
+
+    def aux_find(self, name: str, entry_id: int) -> dict[str, Any] | None:
+        for row in self.aux_rows(name):
             if int(row.get("id", 0)) == entry_id:
                 return row
         return None

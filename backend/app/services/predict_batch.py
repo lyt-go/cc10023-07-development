@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.prediction_delivery import prediction_delivery
 from app.store import store
 
 
@@ -16,6 +17,88 @@ class PredictBatchService(BaseModuleService):
     STATUS_ORDER = ["草稿", "等待中", "运行中", "已完成"]
     ACTION_RULES = {"提交运行": "草稿", "停止预测": "运行中", "确认完成": "已完成"}
     NEGATIVE_ACTIONS = []
+
+    # ── 分片交付：预计分区 → 回执 → 清单 → 版本 ──
+    def register_batch_partitions(self, task_id: int, partitions: Any) -> dict[str, Any]:
+        """登记原预测批次的预计分区，供分片到齐核对使用。"""
+        return prediction_delivery.register_batch_partitions(task_id, partitions)
+
+    def list_batch_partitions(self, task_id: int) -> dict[str, Any]:
+        """查询原预测批次的预计分区清单。"""
+        task = store.find(self.MODULE, task_id)
+        if task is None:
+            return {"ok": False, "message": f"预测任务 {task_id} 不存在"}
+        partitions = prediction_delivery.list_batch_partitions(task_id)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "partitions": partitions,
+            "expected_count": len(partitions),
+        }
+
+    def register_shard_receipt(
+        self,
+        task_id: int,
+        shard_id: str,
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        model_version: str | None = None,
+        partition_index: int | None = None,
+        status: str = "已完成",
+    ) -> dict[str, Any]:
+        """登记分片完成回执；空结果行同样落账，重复回执按最后一次覆盖。"""
+        return prediction_delivery.register_shard_receipt(
+            task_id, shard_id, rows,
+            model_version=model_version,
+            partition_index=partition_index,
+            status=status,
+        )
+
+    def collect_completed_shards(
+        self, task_id: int, model_version: str | None = None
+    ) -> dict[str, Any]:
+        """收集原预测批次的已完成分片。"""
+        return prediction_delivery.collect_completed_shards(task_id, model_version=model_version)
+
+    def merge_shard_results(
+        self, task_id: int, model_version: str | None = None
+    ) -> dict[str, Any]:
+        """按同批同模型版本合并实际结果行并去重。"""
+        return prediction_delivery.merge_shard_results(task_id, model_version=model_version)
+
+    def build_shard_manifest(
+        self, task_id: int, model_version: str | None = None
+    ) -> dict[str, Any]:
+        """生成带覆盖范围的预测分片文件清单。"""
+        return prediction_delivery.build_shard_manifest(task_id, model_version=model_version)
+
+    def publish_delivery_version(
+        self,
+        task_id: int,
+        model_version: str | None = None,
+        *,
+        require_full: bool = False,
+    ) -> dict[str, Any]:
+        """发布抽查版或全量版；全量版要求分片到齐。"""
+        result = prediction_delivery.publish_version(
+            task_id, model_version=model_version, require_full=require_full)
+        task = store.find(self.MODULE, task_id)
+        if result.get("ok") and task is not None:
+            task["交付版本"] = result["version_label"]
+            task["交付状态"] = "全量已发布" if result["full_coverage"] else "抽查已发布"
+        return result
+
+    def list_delivery_versions(self, task_id: int | None = None) -> list[dict[str, Any]]:
+        """列出预测交付版本（可按任务过滤）。"""
+        return prediction_delivery.list_versions(task_id)
+
+    def archive_delivery_version(self, version_id: int) -> dict[str, Any]:
+        """归档已发布版本，冻结的结果行仍可下载。"""
+        return prediction_delivery.archive_version(version_id)
+
+    def reopen_delivery_version(self, version_id: int) -> dict[str, Any]:
+        """重新打开已归档版本。"""
+        return prediction_delivery.reopen_version(version_id)
 
     # ── 链路4: 批量预测 → 挖掘结果 ──
     def execute_batch_and_collect_result(self, task_id: int) -> dict[str, Any]:

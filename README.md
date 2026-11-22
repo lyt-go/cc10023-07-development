@@ -69,6 +69,26 @@ npm run dev
 | 流水线调度 | `pipeline_schedule` | 调度配置 | 调度编号、关联流水线、Cron表达式 |
 | 业务场景标注 | `scenario_label` | 场景标注 | 标注编号、场景名称、关联特征 |
 
+## 批量预测分片交付
+
+批量预测任务原先只登记导出任务，没有可下载的预测行。现在补齐分片交付链路：
+收集原预测批次的已完成分片，按「同批 + 同模型版本」合并实际结果行，生成带覆盖范围的
+预测分片文件清单，再由数据导出管理按清单导出 CSV。
+
+- 回执登记：`POST /api/predict_batch/{id}/shards`（或 `/api/predict_delivery/batches/{id}/shards`）。
+  空结果行的分片只要回执状态为已完成，同样计入实际完成分区；重复回执按分片覆盖、
+  按 `prediction_id` 合并，不会让行数翻倍。
+- 分片清单：`GET /api/predict_batch/{id}/manifest`，含预计分区、实际覆盖分区、缺失分区、
+  覆盖范围和全量标记。
+- 版本发布：`POST /api/predict_batch/{id}/versions`。有缺片时发布的是抽查版；
+  带全量标记（预计分区全部到齐）的版本才允许 `scope=full` 全量复核导出。
+- 归档 / 重新打开：`POST /api/predict_batch/versions/{version_id}/archive|reopen`。
+  版本发布时冻结结果行与覆盖分区，后续迟到分片只进入新版本。
+- 下载：`GET /api/predict_batch/versions/{version_id}/export.csv?scope=spot|full`，
+  列为 `prediction_id、模型编号、分数、标签、预测日期`，同文件内 `prediction_id` 唯一。
+
+三片批次日终抽查的完整场景由 `backend/tests/test_prediction_shard_delivery.py` 覆盖。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
